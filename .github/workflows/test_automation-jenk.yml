@@ -1,0 +1,113 @@
+pipeline {
+    agent {
+        label 'windows' // Use the appropriate agent (e.g., windows)
+    }
+
+    parameters {
+        choice(
+            name: 'BASE_URL',
+            choices: ['https://app.hellodock.com/', 'https://dev.hellodock.com/', 'https://qa.hellodock.com/'],
+            description: 'Select The Environment URL'
+        )
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        AWS_ACCESS_KEY_ID = credentials('AWS_ACCESS_KEY_ID') // Replace with Jenkins credential ID
+        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY') // Replace with Jenkins credential ID
+        SMTP_USER = credentials('SMTP_USER') // Replace with Jenkins credential ID
+        SMTP_PASSWORD = credentials('SMTP_PASSWORD') // Replace with Jenkins credential ID
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate Environment URL') {
+            steps {
+                script {
+                    def statusCode = sh(
+                        script: "curl -o /dev/null -s -w \"%{http_code}\" ${params.BASE_URL}",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Status Code: ${statusCode}"
+                    if (statusCode != '200') {
+                        error "Selected environment URL returned status code ${statusCode}"
+                    }
+                    echo "Environment URL is reachable."
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh 'npm install'
+                sh 'npx playwright install'
+                sh 'npm install -g allure-commandline --save-dev'
+            }
+        }
+
+        stage('Run Playwright Tests') {
+            steps {
+                script {
+                    sh """
+                        echo "Running tests with BASE_URL=${params.BASE_URL}"
+                        BASE_URL=${params.BASE_URL} npx playwright test --reporter=line,allure-playwright || true
+                    """
+                }
+            }
+        }
+
+        stage('Upload Results to S3') {
+            steps {
+                sh 'aws s3 cp ./test-results/ s3://hellodock-testing/test-results/ --recursive'
+                sh 'aws s3 cp ./allure-results/ s3://hellodock-testing/allure-results/ --recursive'
+            }
+        }
+
+        stage('Send Email Notification') {
+            steps {
+                script {
+                    def jobStatus = currentBuild.currentResult // Get the build result
+                    def emailBody = """
+                        Hello Team,
+
+                        The build process for your smoke test is completed. Please use the below details to view results.
+
+                        Environment : ${params.BASE_URL}
+                        Job Status: ${jobStatus}
+                        Jenkins Build URL: ${env.BUILD_URL}
+
+                        Thanks,
+                        HelloDock Automation Team
+                    """
+
+                    emailext(
+                        subject: "${jobStatus} - Test Automation Build Completed",
+                        body: emailBody,
+                        to: 'rahul@allinengineeringconsulting.com',
+                        replyTo: 'no-reply@hellodock.com',
+                        from: 'Hellodock Team <no-reply@hellodock.com>',
+                        mimeType: 'text/plain',
+                        smtpHost: 'email-smtp.us-east-2.amazonaws.com',
+                        smtpPort: 587,
+                        useSsl: false,
+                        authUsername: env.SMTP_USER,
+                        authPassword: env.SMTP_PASSWORD
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: '**/test-results/**', allowEmptyArchive: true
+            archiveArtifacts artifacts: './allure-results/**', allowEmptyArchive: true
+        }
+    }
+}
